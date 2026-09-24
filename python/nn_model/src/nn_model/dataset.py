@@ -45,10 +45,18 @@ class AudioScoreDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         files_info = []
         step_offsets = []
         total_steps = 0
+        self._arrays: list[tuple[NpyReader, NpyReader]] = []
         for audio, scores in file_pairs:
-            audio_shape, audio_type = read_npy_header(audio)
-            scores_shape, _ = read_npy_header(scores)
-            if audio_shape[0] != scores_shape[0] or n_classes != scores_shape[1]:
+            audio_reader = NpyReader(audio)
+            scores_reader = NpyReader(scores)
+            self._arrays.append((audio_reader, scores_reader))
+            audio_shape, audio_type = audio_reader.shape, audio_reader.dtype
+            scores_shape = scores_reader.shape
+            if (
+                len(scores_shape) != 2  # noqa: PLR2004
+                or audio_shape[0] != scores_shape[0]
+                or n_classes != scores_shape[1]
+            ):
                 msg = f"The scores file '{scores}' contains wrong number of elements, it should have (number of audio samples of '{audio}')*{n_classes} elements"
                 raise ValueError(msg)
             n_steps = audio_shape[0] - win_length  # the last window
@@ -78,8 +86,6 @@ class AudioScoreDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
         self.win_mid = win_length // 2
 
-        self._file_cache = {}
-
     def __len__(self):
         """Return number of items in this dataset
 
@@ -89,39 +95,32 @@ class AudioScoreDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         """
         return self.total_steps
 
-    def _cached_file(self, path: str) -> np.ndarray:
-        if path not in self._file_cache:
-            mm = npf.open_memmap(path, mode="r")
-            self._file_cache[path] = mm
-        return self._file_cache[path]
-
     def _end_element(self, file_idx, step) -> int:
         (size, n_steps, _) = self.files_info[file_idx]
         step_end = step + 1
         return size - (n_steps - step_end) * self.hop_length
 
     def _make_audio(self, end_el: int, file_idx: int) -> np.ndarray:
-        audio = self._cached_file(self.file_pairs[file_idx][0])
+        audio = self._arrays[file_idx][0]
 
         audio_seg = np.zeros(self.seg_length, dtype=np.float32)
         if end_el < self.seg_length:
             copy_offset = self.seg_length - end_el
-            audio_seg[copy_offset:] = audio[:end_el].astype(np.float32, copy=False)
+            audio_seg[copy_offset:] = audio.read(0, end_el)
         else:
             start_el = end_el - self.seg_length
-            audio_seg[:] = audio[start_el:end_el].astype(np.float32, copy=False)
+            audio_seg[:] = audio.read(start_el, end_el)
 
         audio_seg *= self.files_info[file_idx][2]
         return audio_seg
 
     def _make_scores(self, end_el: int, file_idx: int) -> np.ndarray:
-        scores = self._cached_file(self.file_pairs[file_idx][1])
         index = end_el - self.win_mid
 
         if index < 0:
-            return np.zeros(scores.shape[1], dtype=np.float32)
+            return np.zeros(self.n_classes, dtype=np.float32)
 
-        return scores[index, :].astype(np.float32, copy=True)
+        return self._arrays[file_idx][1].read(index, index + 1)[0].astype(np.float32)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return audio sample and scores at index
@@ -152,11 +151,62 @@ class RandomOffsetDataset(AudioScoreDataset):
         return max(0, end_el - random.randint(0, self.hop_length - 1))
 
 
-def read_npy_header(path: str) -> tuple[tuple[int, ...], np.dtype]:
-    with open(os.fspath(path), "rb") as fp:
-        version = npf.read_magic(fp)
-        if version[0] == 1:
-            shape, _, dtype = npf.read_array_header_1_0(fp)
-        else:
-            shape, _, dtype = npf.read_array_header_2_0(fp)
-        return shape, dtype
+class NpyReader:
+    """Reads row ranges of a C-ordered .npy file using plain file I/O."""
+
+    def __init__(self, path: str):
+        """Create NpyReader
+
+        Args:
+            path (str): Path to the npy file
+
+        Raises:
+            ValueError: The file is stored in Fortran order
+
+        """
+        self.path = os.fspath(path)
+        with open(self.path, "rb") as fp:
+            version = npf.read_magic(fp)
+            if version[0] == 1:
+                shape, fortran_order, dtype = npf.read_array_header_1_0(fp)
+            else:
+                shape, fortran_order, dtype = npf.read_array_header_2_0(fp)
+            self._data_offset = fp.tell()
+        if fortran_order and len(shape) > 1:
+            msg = f"The file '{path}' is in Fortran order, which is not supported"
+            raise ValueError(msg)
+        self.shape: tuple[int, ...] = shape
+        self.dtype: np.dtype = dtype
+        self._row_shape = shape[1:]
+        self._row_bytes = dtype.itemsize * int(np.prod(self._row_shape, dtype=np.int64))
+        self._fp = None
+
+    def __getstate__(self):
+        """Get the state for pickling"""
+        state = self.__dict__.copy()
+        state["_fp"] = None  # file handles can't be shared with the workers
+        return state
+
+    def read(self, start: int, stop: int) -> np.ndarray:
+        """Read the rows [start, stop)
+
+        Args:
+            start (int): The first row
+            stop (int): The row after the last one
+
+        Returns:
+            np.ndarray: The rows, shape is (stop - start, *shape[1:])
+
+        """
+        out = np.empty((stop - start, *self._row_shape), dtype=self.dtype)
+        if self._fp is None:
+            self._fp = open(self.path, "rb", buffering=0)  # noqa: SIM115
+        self._fp.seek(self._data_offset + start * self._row_bytes)
+        view = memoryview(out.reshape(-1).view(np.uint8))
+        while len(view) > 0:
+            n = self._fp.readinto(view)
+            if not n:
+                msg = f"Unexpected end of file '{self.path}'"
+                raise EOFError(msg)
+            view = view[n:]
+        return out

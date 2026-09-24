@@ -138,6 +138,7 @@ class MelExtractor(nn.Module):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.n_freq = n_fft // 2 + 1
+        self.use_fft = False
 
         mel_fb = librosa.filters.mel(
             sr=sample_rate,
@@ -174,10 +175,21 @@ class MelExtractor(nn.Module):
             torch.Tensor: mel frames (B, n_mels, n_frames)
 
         """
-        x = x.unsqueeze(1)  # (B, 1, n_samples)
-        x = self.stft_conv(x)  # (B, 2*n_freq, n_frames)
-        real, imag = x.split(self.n_freq, dim=1)
-        x = real.pow(2) + imag.pow(2)
+        if self.use_fft:
+            spec = torch.stft(
+                x,
+                self.n_fft,
+                hop_length=self.hop_length,
+                window=self.window,  # ty:ignore[invalid-argument-type]
+                center=False,
+                return_complex=True,
+            )  # (B, n_freq, n_frames)
+            x = spec.real.pow(2) + spec.imag.pow(2)
+        else:
+            x = x.unsqueeze(1)  # (B, 1, n_samples)
+            x = self.stft_conv(x)  # (B, 2*n_freq, n_frames)
+            real, imag = x.split(self.n_freq, dim=1)
+            x = real.pow(2) + imag.pow(2)
 
         x = x.transpose(2, 1)
         x = torch.matmul(x, self.mel_fb_t)  # ty:ignore[invalid-argument-type]
