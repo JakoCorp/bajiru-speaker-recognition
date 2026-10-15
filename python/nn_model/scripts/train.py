@@ -26,6 +26,7 @@ hop_length = model_preset.hop_length
 n_classes = model_preset.n_classes
 model = model_preset.model
 model = model.to(device)
+model.mel_spec.use_fft = True
 
 
 def make_source(

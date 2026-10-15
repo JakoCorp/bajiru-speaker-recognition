@@ -98,15 +98,14 @@ class LRScheduler:
 
     def _calc_lr(self, epoch: int, ratio: float) -> float:
         index = len(self.pairs) - 1
-        for i in range(0, len(self.pairs), -1):
-            if epoch < self.pairs[i][0]:
+        for i, (pair_epoch, _) in enumerate(self.pairs):
+            if epoch < pair_epoch:
+                index = i
                 break
-            index = i
         min_pair = (0, 0.0) if index == 0 else self.pairs[index - 1]
         max_pair = self.pairs[index]
-        return min_pair[1] + (
-            (epoch - min_pair[0] + ratio) / (max_pair[0] - min_pair[0])
-        ) * (max_pair[1] - min_pair[1])
+        frac = min(1.0, (epoch - min_pair[0] + ratio) / (max_pair[0] - min_pair[0]))
+        return min_pair[1] + frac * (max_pair[1] - min_pair[1])
 
 
 class CheckpointManager:
